@@ -2,18 +2,18 @@
 Streamlit app: paste any mix of Instagram URLs (posts, reels, IGTV, profiles,
 stories) and get back the original profile URL for each one.
 
+Uses Playwright (headless Chromium with a mobile UA) to bypass Instagram's
+unauthenticated-fetch blank-shell response.
+
 Run:
-    streamlit run app.py
+    py -m streamlit run app.py
 """
 
 import io
 import re
 import time
 import pandas as pd
-import requests
 import streamlit as st
-from bs4 import BeautifulSoup
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ---------- URL parsing ---------------------------------------------------
 
@@ -41,13 +41,17 @@ RESERVED = {
     "directory", "about", "developer", "legal", "press", "web",
 }
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-}
+MOBILE_UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+    "Mobile/15E148 Safari/604.1"
+)
+
+USERNAME_PATTERNS = [
+    re.compile(r'"owner":\{[^}]*"username":"([A-Za-z0-9_.]+)"'),
+    re.compile(r'"username":"([A-Za-z0-9_.]+)"'),
+    re.compile(r'\(@([A-Za-z0-9_.]+)\)'),
+]
 
 
 def extract_urls(text: str) -> list[str]:
@@ -61,8 +65,18 @@ def extract_urls(text: str) -> list[str]:
     return out
 
 
+def normalize(url: str) -> str:
+    """Canonicalize the URL so /reels/ -> /reel/ and trailing extra paths drop."""
+    m = POST_RE.match(url)
+    if m:
+        kind = m.group(1).lower()
+        if kind in ("reels",):
+            kind = "reel"
+        return f"https://www.instagram.com/{kind}/{m.group(2)}/"
+    return url
+
+
 def quick_username(url: str) -> str | None:
-    """Return username without any network call, when the URL alone has it."""
     m = USER_POST_RE.match(url)
     if m and m.group(1).lower() not in RESERVED:
         return m.group(1)
@@ -75,53 +89,48 @@ def quick_username(url: str) -> str | None:
     return None
 
 
-def scrape_username(url: str, timeout: int = 10) -> str | None:
-    """Fetch a post/reel page and parse the username from og:title."""
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True)
-    except requests.RequestException:
-        return None
-    if r.status_code != 200 or not r.text:
-        return None
+def classify(url: str) -> str:
+    if USER_POST_RE.match(url):
+        return "user-post"
+    if POST_RE.match(url):
+        return "post"
+    if STORIES_RE.match(url):
+        return "story"
+    if PROFILE_RE.match(url):
+        return "profile"
+    return "unknown"
 
-    soup = BeautifulSoup(r.text, "html.parser")
-    og = soup.find("meta", property="og:title")
-    if og and og.get("content"):
-        # Typical form: "Username (@handle) on Instagram: ..."
-        m = re.search(r"\(@([A-Za-z0-9_.]+)\)", og["content"])
-        if m:
+
+def extract_from_html(html: str) -> str | None:
+    for pat in USERNAME_PATTERNS:
+        m = pat.search(html)
+        if m and m.group(1).lower() not in RESERVED:
             return m.group(1)
-
-    # Fallback: alternate handle pattern in raw HTML
-    m = re.search(r'"username":"([A-Za-z0-9_.]+)"', r.text)
-    if m:
-        return m.group(1)
     return None
 
 
-def resolve(url: str) -> dict:
-    original = url.strip()
-    kind = "unknown"
-    if PROFILE_RE.match(original) and not POST_RE.match(original):
-        kind = "profile"
-    elif POST_RE.match(original):
-        kind = "post"
-    elif STORIES_RE.match(original):
-        kind = "story"
-    elif USER_POST_RE.match(original):
-        kind = "user-post"
+def resolve_with_browser(urls: list[str], wait_ms: int, progress_cb) -> dict[str, str | None]:
+    """Open one headless Chromium, resolve each URL that needs a page fetch."""
+    from playwright.sync_api import sync_playwright
 
-    uname = quick_username(original)
-    if not uname and kind == "post":
-        uname = scrape_username(original)
-
-    return {
-        "input_url": original,
-        "type": kind,
-        "username": uname or "",
-        "profile_url": f"https://www.instagram.com/{uname}/" if uname else "",
-        "status": "ok" if uname else "unresolved",
-    }
+    out: dict[str, str | None] = {}
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        ctx = browser.new_context(
+            user_agent=MOBILE_UA,
+            viewport={"width": 390, "height": 844},
+        )
+        page = ctx.new_page()
+        for i, url in enumerate(urls, start=1):
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=25000)
+                page.wait_for_timeout(wait_ms)
+                out[url] = extract_from_html(page.content())
+            except Exception:
+                out[url] = None
+            progress_cb(i, len(urls))
+        browser.close()
+    return out
 
 
 # ---------- Streamlit UI --------------------------------------------------
@@ -138,14 +147,15 @@ with st.form("input_form"):
         "Paste Instagram URLs (one per line, comma-separated, or wall of text — anything goes)",
         height=220,
         placeholder=(
-            "https://www.instagram.com/p/Cxyz.../\n"
-            "https://www.instagram.com/reel/Dabc.../\n"
+            "https://www.instagram.com/p/DUuwNpHkXEH/\n"
+            "https://www.instagram.com/reel/DG_FLH7MplK/\n"
             "https://www.instagram.com/somebrand/\n"
         ),
     )
     col1, col2 = st.columns([1, 3])
     with col1:
-        workers = st.slider("Parallel requests", 1, 16, 6)
+        wait_ms = st.slider("Page wait (ms)", 1500, 6000, 3000, 500,
+                            help="How long to let Instagram's JS hydrate before reading the page.")
     with col2:
         submitted = st.form_submit_button("Extract profiles", type="primary", use_container_width=True)
 
@@ -155,29 +165,56 @@ if submitted:
         st.warning("No URLs detected in the input.")
         st.stop()
 
-    st.info(f"Found {len(urls)} URL(s). Resolving…")
-    progress = st.progress(0.0)
-    results: list[dict] = []
-    started = time.time()
+    # Normalize + classify, separate quick wins from URLs that need browser fetch
+    rows: list[dict] = []
+    needs_browser: list[str] = []
+    for raw in urls:
+        nu = normalize(raw)
+        kind = classify(nu)
+        uname = quick_username(nu)
+        rows.append({"input_url": raw, "normalized": nu, "type": kind, "username": uname})
+        if not uname and kind in ("post", "user-post", "unknown"):
+            if nu not in needs_browser:
+                needs_browser.append(nu)
 
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {ex.submit(resolve, u): u for u in urls}
-        for i, fut in enumerate(as_completed(futures), start=1):
-            results.append(fut.result())
-            progress.progress(i / len(urls))
+    st.info(
+        f"Found {len(urls)} URL(s). "
+        f"{len(urls) - len(needs_browser)} resolved instantly, "
+        f"{len(needs_browser)} need a headless browser fetch."
+    )
 
-    progress.empty()
-    elapsed = time.time() - started
+    if needs_browser:
+        progress = st.progress(0.0, text="Launching headless Chromium…")
 
-    # Preserve original input order
-    order = {u: i for i, u in enumerate(urls)}
-    results.sort(key=lambda r: order.get(r["input_url"], 0))
+        def cb(i, total):
+            progress.progress(i / total, text=f"Fetched {i}/{total}")
 
-    df = pd.DataFrame(results)
+        started = time.time()
+        try:
+            resolved = resolve_with_browser(needs_browser, wait_ms, cb)
+        except Exception as e:
+            st.error(
+                f"Playwright failed to launch: {e}\n\n"
+                "If this is the first run, install the browser:\n\n"
+                "`py -m playwright install chromium`"
+            )
+            st.stop()
+        progress.empty()
 
-    # Unique profile list
+        for r in rows:
+            if not r["username"] and r["normalized"] in resolved:
+                r["username"] = resolved[r["normalized"]]
+
+        st.caption(f"Browser pass done in {time.time() - started:.1f}s")
+
+    for r in rows:
+        r["profile_url"] = f"https://www.instagram.com/{r['username']}/" if r["username"] else ""
+        r["status"] = "ok" if r["username"] else "unresolved"
+
+    df = pd.DataFrame(rows)
+
     unique_profiles = (
-        df.loc[df["username"] != "", ["username", "profile_url"]]
+        df.loc[df["username"].astype(bool), ["username", "profile_url"]]
         .drop_duplicates()
         .reset_index(drop=True)
     )
@@ -189,7 +226,6 @@ if submitted:
     c2.metric("Resolved", ok)
     c3.metric("Unresolved", bad)
     c4.metric("Unique profiles", len(unique_profiles))
-    st.caption(f"Done in {elapsed:.1f}s")
 
     st.subheader("Unique profiles")
     st.dataframe(unique_profiles, use_container_width=True, hide_index=True)
