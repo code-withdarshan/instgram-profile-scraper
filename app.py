@@ -10,10 +10,39 @@ Run:
 """
 
 import io
+import os
 import re
+import subprocess
+import sys
 import time
+from pathlib import Path
+
 import pandas as pd
 import streamlit as st
+
+
+@st.cache_resource(show_spinner="Installing headless browser (first run only)…")
+def ensure_chromium() -> bool:
+    """Install Playwright's chromium browser on first run (e.g. Streamlit Cloud)."""
+    marker = Path.home() / ".cache" / "ms-playwright" / ".installed"
+    if marker.exists():
+        return True
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            check=True,
+            capture_output=True,
+            timeout=300,
+        )
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+        return True
+    except Exception as e:
+        st.warning(f"Browser auto-install failed: {e}")
+        return False
+
+
+ensure_chromium()
 
 # ---------- URL parsing ---------------------------------------------------
 
